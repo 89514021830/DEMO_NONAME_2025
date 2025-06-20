@@ -1,0 +1,228 @@
+Шаг 1. Миграция на новый контроллер домена BR-SRV с HQ-SRV
+На BR-SRV (новый контроллер Samba) и HQ-SRV (наследуемый)
+1.	На HQ-SRV: Экспорт пользователей, групп, подразделений и прав:
+sudo samba-tool user list > users.txt
+sudo samba-tool group list > groups.txt
+
+# Пример экспорта в CSV:
+sudo samba-tool user list | while read u; do
+    desc=$(sudo samba-tool user show "$u" | grep "Full Name" | cut -d: -f2-)
+    echo "$u,$desc,P@ssw0rd" >> exported_users.csv
+done
+2.	Передать файл на BR-SRV:
+scp exported_users.csv sshuser@br-srv.au-team.irpo:/opt/
+3.	На BR-SRV: Импорт пользователей и добавление в группу:
+while IFS=',' read -r username fullname password; do
+  sudo samba-tool user create "$username" "$password" --given-name="${fullname}"
+  sudo samba-tool group addmembers hq "$username"
+done < /opt/exported_users.csv
+4.	Общие папки:
+Создай:
+sudo mkdir -p /srv/shared/hq
+sudo chown root:hq /srv/shared/hq
+sudo chmod 2770 /srv/shared/hq
+Добавь в /etc/samba/smb.conf:
+ [HQShare]
+   path = /srv/shared/hq
+   valid users = @hq
+   read only = no
+   force group = hq
+   create mask = 0660
+   directory mask = 2770
+Перезапуск:
+sudo systemctl restart samba-ad-dc
+5.	Автомонтирование на HQ-CLI:
+Добавь в /etc/fstab:
+//br-srv.au-team.irpo/HQShare  /mnt/hq  cifs  credentials=/etc/samba/creds,iocharset=utf8,sec=ntlmssp  0  0
+________________________________________
+✅ Шаг 2. Центр сертификации на HQ-SRV
+1.	Установка Easy-RSA:
+sudo apt install easy-rsa -y
+make-cadir ~/pki
+cd ~/pki
+./easyrsa init-pki
+./easyrsa build-ca
+2.	Создание сертификатов для nginx, Moodle, Wiki:
+./easyrsa gen-req moodle nopass
+./easyrsa sign-req server moodle
+3.	Копирование на HQ-RTR, HQ-SRV, BR-SRV:
+scp pki/issued/moodle.crt pki/private/moodle.key sshuser@hq-rtr:/etc/nginx/ssl/
+4.	Обновление конфигов nginx (на HQ-RTR):
+server {
+  listen 443 ssl;
+  server_name moodle.au-team.irpo;
+  ssl_certificate /etc/nginx/ssl/moodle.crt;
+  ssl_certificate_key /etc/nginx/ssl/moodle.key;
+  ...
+}
+5.	Обеспечить доверие на HQ-CLI:
+sudo cp pki/ca.crt /usr/local/share/ca-certificates/au-team.crt
+sudo update-ca-certificates
+________________________________________
+✅ Шаг 3. Защищённый туннель между HQ-RTR и BR-RTR
+1.	Установка WireGuard (альтернатива GRE+IPsec):
+sudo apt install wireguard -y
+2.	Генерация ключей и настройка /etc/wireguard/wg0.conf:
+На HQ-RTR:
+ [Interface]
+Address = 10.20.20.1/30
+PrivateKey = <PRIVATE_KEY>
+ListenPort = 51820
+
+[Peer]
+PublicKey = <BR_PUBLIC_KEY>
+AllowedIPs = 10.20.20.2/32, 192.168.100.0/27
+Endpoint = br-rtr.au-team.irpo:51820
+PersistentKeepalive = 25
+3.	Аналогично на BR-RTR, только IP будет 10.20.20.2/30.
+4.	Запуск:
+sudo systemctl enable wg-quick@wg0
+sudo systemctl start wg-quick@wg0
+5.	OSPF маршрутизация поверх wg0 — обнови vtysh:
+router ospf
+ network 10.20.20.0/30 area 0
+________________________________________
+✅ Шаг 4. Межсетевой экран
+Пример (HQ-RTR):
+sudo iptables -P INPUT DROP
+sudo iptables -A INPUT -i enp0s3 -p tcp --dport 80 -j ACCEPT
+sudo iptables -A INPUT -i enp0s3 -p tcp --dport 443 -j ACCEPT
+sudo iptables -A INPUT -p icmp -j ACCEPT
+sudo iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+sudo netfilter-persistent save
+________________________________________
+✅ Шаг 5. Принт-сервер на HQ-SRV (PDF)
+sudo apt install cups printer-driver-cups-pdf -y
+sudo cupsctl --remote-admin --remote-any
+sudo systemctl restart cups
+Добавление PDF-принтера:
+lpadmin -p PDF -E -v cups-pdf:/ -m driverless
+На HQ-CLI:
+lpoptions -d PDF
+________________________________________
+✅ Шаг 6. Логирование rsyslog
+На HQ-SRV:
+sudo mkdir -p /opt/logs/{hq-rtr,br-rtr,br-srv}
+sudo nano /etc/rsyslog.d/remote.conf
+Добавь:
+$template PerHost,"/opt/logs/%HOSTNAME%/%PROGRAMNAME%.log"
+*.* ?PerHost
+& stop
+На клиентах (BR-RTR, HQ-RTR, BR-SRV):
+echo "*.warning @hq-srv.au-team.irpo" | sudo tee /etc/rsyslog.d/log.conf
+sudo systemctl restart rsyslog
+________________________________________
+✅ Шаг 7. Мониторинг (на HQ-SRV)
+Пример: Netdata
+bash <(curl -Ss https://my-netdata.io/kickstart.sh) --non-interactive
+После установки:
+•	Доступен по https://mon.au-team.irpo:19999
+•	Логин admin / P@ssw0rd настраивается вручную или через прокси
+________________________________________
+✅ Шаг 8. Инвентаризация Ansible
+На BR-SRV:
+Плейбук: /etc/ansible/pc_info.yml
+- hosts: hq-cli.au-team.irpo,hq-srv.au-team.irpo
+  gather_facts: yes
+  tasks:
+    - name: Сохраняем инфо
+      copy:
+        content: |
+          hostname: {{ ansible_hostname }}
+          ip: {{ ansible_default_ipv4.address }}
+        dest: "/etc/ansible/PC_INFO/{{ inventory_hostname }}.yml"
+mkdir -p /etc/ansible/PC_INFO
+ansible-playbook /etc/ansible/pc_info.yml
+________________________________________
+✅ Шаг 9. Резервное копирование конфигураций (через Ansible)
+Плейбук: /etc/ansible/backup_conf.yml
+- hosts: hq-rtr.au-team.irpo,br-rtr.au-team.irpo
+  gather_facts: no
+  tasks:
+    - name: Копируем /etc/frr/frr.conf
+      fetch:
+        src: /etc/frr/frr.conf
+        dest: /etc/ansible/backup/{{ inventory_hostname }}/
+        flat: yes
+mkdir -p /etc/ansible/backup
+ansible-playbook /etc/ansible/backup_conf.yml
+
+Ошибки и решения — Модуль 3 (КОД 09.02.06-1-2025)
+1. Ошибка при импорте пользователей Samba
+•	❗ Симптом: Failed to add user... user already exists или user not found при добавлении в группу
+•	✅ Решение:
+1.	Выполни команду: sudo samba-tool user list, чтобы убедиться, существует ли пользователь.
+2.	Если пользователь уже есть — пропусти создание:
+3.	  samba-tool user create "$username" "$password" || true
+4.	Аналогично при добавлении в группу:
+5.	  samba-tool group addmembers hq "$username" || true
+6.	Проверь, что файл users.csv имеет правильный формат: username,password.
+2. NET::ERR_CERT_AUTHORITY_INVALID в браузере HQ-CLI
+•	❗ Симптом: Браузер сообщает о недоверенном сертификате
+•	✅ Решение:
+7.	Скопируй корневой сертификат (например ca.crt) на HQ-CLI.
+8.	Установи его в доверенные корневые центры сертификации:
+9.	  sudo cp ca.crt /usr/local/share/ca-certificates/au.crt
+10.	  sudo update-ca-certificates
+11.	Перезапусти браузер и проверь доступность сайтов без предупреждений.
+3. WireGuard не запускается
+•	❗ Симптом: RTNETLINK answers: Operation not supported или Cannot find device 'wg0'
+•	✅ Решение:
+12.	Убедись, что WireGuard установлен: sudo apt install wireguard -y
+13.	Загрузи модуль ядра: sudo modprobe wireguard
+14.	Проверь конфигурационный файл /etc/wireguard/wg0.conf
+15.	Запусти: sudo wg-quick up wg0
+16.	Если не помогает — перезагрузи машину.
+4. Нет доступа к сервисам (SSH, HTTP, Moodle и др.)
+•	❗ Симптом: Сервисы не доступны извне, нет подключения
+•	✅ Решение:
+17.	Проверь iptables: sudo iptables -L -n и sudo iptables -t nat -L -n
+18.	Разреши нужные порты:
+19.	  sudo iptables -A INPUT -p tcp --dport 2024 -j ACCEPT
+20.	  sudo iptables -A INPUT -p tcp --dport 80 -j ACCEPT
+21.	  sudo iptables -A INPUT -p tcp --dport 443 -j ACCEPT
+22.	  sudo iptables -A INPUT -p tcp --dport 631 -j ACCEPT
+23.	  sudo iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+24.	Сохрани правила: sudo netfilter-persistent save
+5. Принтер PDF не отображается на HQ-CLI
+•	❗ Симптом: CUPS установлен, но HQ-CLI не видит принтер
+•	✅ Решение:
+25.	Проверь статус: sudo systemctl status cups
+26.	Проверь порт: sudo ss -tulpn | grep 631
+27.	Установи вручную:
+28.	  lpstat -a
+29.	  lpadmin -p PDF -E -v cups-pdf:/ -m everywhere
+30.	  lpoptions -d PDF
+6. Логи rsyslog не приходят на HQ-SRV
+•	❗ Симптом: В каталоге /opt/logs нет файлов
+•	✅ Решение:
+31.	Проверь конфиг /etc/rsyslog.d/remote.conf
+32.	Разреши порт 514/udp: sudo ufw allow 514/udp
+33.	На клиентах добавь правило:
+34.	  echo "*.warning @hq-srv.au-team.irpo" | sudo tee /etc/rsyslog.d/log.conf
+35.	Перезапусти rsyslog: sudo systemctl restart rsyslog
+7. Netdata не открывается
+•	❗ Симптом: ERR_CONNECTION_REFUSED при открытии веб-интерфейса
+•	✅ Решение:
+36.	Проверь статус: sudo systemctl status netdata
+37.	Проверь порт: sudo ss -tulpn | grep 19999
+38.	Разреши порт: sudo iptables -A INPUT -p tcp --dport 19999 -j ACCEPT
+8. Ansible выдаёт UNREACHABLE или Permission denied
+•	❗ Симптом: Ошибка подключения по SSH в Ansible
+•	✅ Решение:
+39.	Проверь SSH-доступ: ssh sshuser@hq-cli.au-team.irpo
+40.	Если требует пароль — скопируй ключ: ssh-copy-id sshuser@hq-cli.au-team.irpo
+41.	Проверь инвентарь и ping: ansible office -m ping
+9. Moodle или Wiki не открываются
+•	❗ Симптом: Страница не загружается, ошибка подключения
+•	✅ Решение:
+42.	Проверь контейнеры: docker ps
+43.	Проверь DNAT: sudo iptables -t nat -L -n
+44.	Проверь nginx: sudo nginx -t && sudo systemctl restart nginx
+10. NFS/Samba папки не монтируются
+•	❗ Симптом: mount.nfs: access denied by server или ошибка при монтировании
+•	✅ Решение:
+45.	Проверь /etc/exports: правильно ли указаны IP и параметры доступа
+46.	Применение: sudo exportfs -ra && sudo systemctl restart nfs-server
+47.	На клиенте: sudo mount -a и df -h
+
