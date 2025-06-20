@@ -238,8 +238,6 @@ sudo ip route add default via 172.16.4.1 dev enp0s3
 
 Зайти sudo nano /etc/resolv.conf
 
-nameserver 8.8.8.8  Он пропадает часто из файла, можно как-то поставить постоянно, но я не разбирался в этом. Поэтому если нет интернета или пинга, проверять и добавлять его если удалился
-
 Настройка BR-RTR
 1. Присвоение имени
 sudo hostnamectl set-hostname br-rtr.au-team.irpo
@@ -331,7 +329,6 @@ sudo ip route add default via 172.16.5.1 dev enp0s3
 
 Зайти sudo nano /etc/resolv.conf
 
-nameserver 8.8.8.8  Он пропадает часто из файла, можно как-то поставить постоянно, но я не разбирался в этом. Поэтому если нет интернета или пинга, проверять и добавлять его если удалился
 
 ПРОВЕРИТЬ ИМЕНА СЕТЕВЫХ АДАПТЕРОВ
 
@@ -515,7 +512,7 @@ network:
         addresses: [8.8.8.8]
         search: [au-team.irpo]
 
-ВТОРОЙ ВАРИАНТ
+ВЕРНЫЙ ОБНОВЛЁННЫЙ ВАРИАНТ 
 network:
   version: 2
   renderer: networkd
@@ -597,7 +594,6 @@ default via 172.16.100.1 dev enp0s3.100
 ________________________________________
 И сразу:
 ping 8.8.8.8
-ОПЯТЬ ЖЕ ПРОВЕРЯТЬ nameserver 8.8.8.8 в /etc/resolv.conf
 BR-SRV
 Настройка BR-SRV (сервер в офисе BR)
 ________________________________________
@@ -633,7 +629,7 @@ network:
         addresses: [8.8.8.8]
         search: [au-team.irpo]
 
-ВТОРОЙ ВАРИАНТ
+ОБНОВЛЕННЫЙ ВЕРНЫЙ ВАРИАНТ 
 
 network:
   version: 2
